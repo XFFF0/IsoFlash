@@ -15,10 +15,11 @@ class UsbScsiDevice(private val manager: UsbManager, val usbDevice: UsbDevice) :
         get() = usbDevice.productName?.takeIf { it.isNotBlank() }
             ?: "USB %04x:%04x".format(usbDevice.vendorId, usbDevice.productId)
 
-    private var connection: UsbDeviceConnection? = null
-    private var bulkIn: UsbEndpoint? = null
-    private var bulkOut: UsbEndpoint? = null
-    private var iface: UsbInterface? = null
+    // Non-nullable after init() — crash fix
+    private lateinit var conn: UsbDeviceConnection
+    private lateinit var epIn: UsbEndpoint
+    private lateinit var epOut: UsbEndpoint
+    private lateinit var iface: UsbInterface
     private var tagCounter = 1
 
     fun init() {
@@ -35,45 +36,100 @@ class UsbScsiDevice(private val manager: UsbManager, val usbDevice: UsbDevice) :
                         if (ep.direction == UsbConstants.USB_DIR_IN) inEp = ep else outEp = ep
                     }
                 }
-                check(inEp != null && outEp != null) { "Missing bulk endpoints" }
-                val conn = manager.openDevice(usbDevice) ?: error("Cannot open USB device")
-                check(conn.claimInterface(intf, true)) { "Cannot claim interface" }
-                connection = conn; bulkIn = inEp; bulkOut = outEp; iface = intf
+                val c = manager.openDevice(usbDevice) ?: error("لا يمكن فتح جهاز USB")
+                // force=true releases kernel driver if any
+                if (!c.claimInterface(intf, true)) {
+                    c.close(); error("لا يمكن حجز واجهة USB")
+                }
+                conn = c
+                epIn  = inEp  ?: run { c.close(); error("Bulk-IN endpoint مفقود") }
+                epOut = outEp ?: run { c.close(); error("Bulk-OUT endpoint مفقود") }
+                iface = intf
                 return
             }
         }
-        error("No USB Mass Storage interface found")
+        error("لم يُعثر على واجهة USB Mass Storage")
     }
 
     override fun close() {
-        runCatching { iface?.let { connection?.releaseInterface(it) }; connection?.close() }
-        connection = null
+        runCatching {
+            if (::iface.isInitialized && ::conn.isInitialized) conn.releaseInterface(iface)
+            if (::conn.isInitialized) conn.close()
+        }
+    }
+
+    /** READ CAPACITY (10) → (totalSectors, blockSize) */
+    fun readCapacity(): Pair<Long, Int> {
+        val cdb = ByteArray(10).also { it[0] = 0x25.toByte() }
+        val data = ByteArray(8)
+        sendCommand(cdb, null, data)
+        val lastLba = ((data[0].toLong() and 0xFF) shl 24) or
+                      ((data[1].toLong() and 0xFF) shl 16) or
+                      ((data[2].toLong() and 0xFF) shl  8) or
+                       (data[3].toLong() and 0xFF)
+        val blkSz   = ((data[4].toInt()  and 0xFF) shl 24) or
+                      ((data[5].toInt()  and 0xFF) shl 16) or
+                      ((data[6].toInt()  and 0xFF) shl  8) or
+                       (data[7].toInt()  and 0xFF)
+        return Pair(lastLba + 1, blkSz)
     }
 
     fun writeBlocks(lba: Long, data: ByteArray) {
-        require(data.size % BLOCK_SIZE == 0)
+        require(data.size % BLOCK_SIZE == 0) { "البيانات يجب أن تكون مضاعفاً لـ $BLOCK_SIZE" }
         val blockCount = data.size / BLOCK_SIZE
-        val tag = tagCounter++
-        val cbw = ByteArray(31).also { b ->
-            b[0]=0x55;b[1]=0x53;b[2]=0x42;b[3]=0x43
-            b[4]=(tag).toByte();b[5]=(tag shr 8).toByte();b[6]=(tag shr 16).toByte();b[7]=(tag shr 24).toByte()
-            b[8]=(data.size).toByte();b[9]=(data.size shr 8).toByte();b[10]=(data.size shr 16).toByte();b[11]=(data.size shr 24).toByte()
-            b[12]=0x00; b[13]=0x00; b[14]=10
-            b[15]=0x2A
-            b[17]=(lba shr 24).toByte();b[18]=(lba shr 16).toByte();b[19]=(lba shr 8).toByte();b[20]=(lba).toByte()
-            b[22]=(blockCount shr 8).toByte();b[23]=(blockCount).toByte()
+        val cdb = ByteArray(10).also { b ->
+            b[0] = 0x2A
+            b[2] = (lba shr 24).toByte(); b[3] = (lba shr 16).toByte()
+            b[4] = (lba shr  8).toByte(); b[5] = lba.toByte()
+            b[7] = (blockCount shr 8).toByte(); b[8] = blockCount.toByte()
         }
-        val conn = connection ?: error("Not open")
-        check(conn.bulkTransfer(bulkOut, cbw, cbw.size, TIMEOUT) >= 0) { "CBW failed" }
-        check(conn.bulkTransfer(bulkOut, data, data.size, TIMEOUT) >= 0) { "Data failed" }
+        sendCommand(cdb, data, null)
+    }
+
+    fun readBlocks(lba: Long, count: Int): ByteArray {
+        val data = ByteArray(count * BLOCK_SIZE)
+        val cdb = ByteArray(10).also { b ->
+            b[0] = 0x28
+            b[2] = (lba shr 24).toByte(); b[3] = (lba shr 16).toByte()
+            b[4] = (lba shr  8).toByte(); b[5] = lba.toByte()
+            b[7] = (count shr 8).toByte(); b[8] = count.toByte()
+        }
+        sendCommand(cdb, null, data)
+        return data
+    }
+
+    private fun sendCommand(cdb: ByteArray, dataOut: ByteArray?, dataIn: ByteArray?) {
+        val tag = tagCounter++
+        val dataLen = dataOut?.size ?: dataIn?.size ?: 0
+        val flags: Byte = if (dataIn != null) 0x80.toByte() else 0x00
+
+        val cbw = ByteArray(31).also { b ->
+            b[0]=0x55; b[1]=0x53; b[2]=0x42; b[3]=0x43
+            b[4]=(tag).toByte();b[5]=(tag shr 8).toByte();b[6]=(tag shr 16).toByte();b[7]=(tag shr 24).toByte()
+            b[8]=(dataLen).toByte();b[9]=(dataLen shr 8).toByte();b[10]=(dataLen shr 16).toByte();b[11]=(dataLen shr 24).toByte()
+            b[12]=flags; b[13]=0x00; b[14]=cdb.size.toByte()
+            System.arraycopy(cdb, 0, b, 15, cdb.size)
+        }
+        xfer(epOut, cbw)
+        if (dataOut != null) xfer(epOut, dataOut)
+        if (dataIn  != null) xferIn(epIn, dataIn)
         val csw = ByteArray(13)
-        check(conn.bulkTransfer(bulkIn, csw, csw.size, TIMEOUT) >= 0) { "CSW failed" }
-        check(csw[12] == 0.toByte()) { "SCSI error status=${csw[12]}" }
+        xferIn(epIn, csw)
+        check(csw[12] == 0.toByte()) { "SCSI error: status=${csw[12].toInt() and 0xFF}" }
+    }
+
+    private fun xfer(ep: UsbEndpoint, data: ByteArray) {
+        val n = conn.bulkTransfer(ep, data, data.size, TIMEOUT)
+        check(n >= 0) { "Bulk-OUT transfer failed (ret=$n)" }
+    }
+    private fun xferIn(ep: UsbEndpoint, buf: ByteArray) {
+        val n = conn.bulkTransfer(ep, buf, buf.size, TIMEOUT)
+        check(n >= 0) { "Bulk-IN transfer failed (ret=$n)" }
     }
 
     companion object {
         const val BLOCK_SIZE = 512
-        const val TIMEOUT = 15_000
+        const val TIMEOUT    = 15_000
 
         fun findDevices(context: Context): List<UsbScsiDevice> {
             val mgr = context.getSystemService(Context.USB_SERVICE) as UsbManager

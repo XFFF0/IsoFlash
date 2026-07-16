@@ -22,36 +22,43 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 
-enum class BurnPhase { IDLE, AWAITING_PERMISSION, WRITING, DONE, FAILED }
+enum class OpPhase { IDLE, AWAITING_PERMISSION, WORKING, DONE, FAILED }
 
-data class BurnUiState(
-    val phase: BurnPhase = BurnPhase.IDLE,
-    val message: String = "",
-    val progress: Float = 0f,
-    val speedMbPerSec: Double = 0.0,
-    val writtenMb: Double = 0.0,
-    val totalMb: Double = 0.0
+data class OpState(
+    val phase:         OpPhase = OpPhase.IDLE,
+    val message:       String  = "",
+    val progress:      Float   = 0f,
+    val speedMbPerSec: Double  = 0.0
 )
 
 class BurnViewModel(application: Application) : AndroidViewModel(application) {
 
-    var drives by mutableStateOf<List<UsbScsiDevice>>(emptyList()); private set
-    var selectedDrive by mutableStateOf<UsbScsiDevice?>(null); private set
-    var selectedIsoUri by mutableStateOf<Uri?>(null); private set
-    var selectedIsoName by mutableStateOf<String?>(null); private set
-    var selectedIsoSizeBytes by mutableStateOf(0L); private set
-    var uiState by mutableStateOf(BurnUiState()); private set
+    // ── UI state ──────────────────────────────────────────────────────────────
+    var drives       by mutableStateOf<List<UsbScsiDevice>>(emptyList()); private set
+    var selectedDrive by mutableStateOf<UsbScsiDevice?>(null);           private set
 
+    var isoUri       by mutableStateOf<Uri?>(null);                      private set
+    var isoName      by mutableStateOf<String?>(null);                   private set
+    var isoSizeBytes by mutableStateOf(0L);                              private set
+
+    // Format options
+    var fmtScheme    by mutableStateOf(DiskFormatter.PartitionScheme.MBR); private set
+    var fmtType      by mutableStateOf(DiskFormatter.FormatType.FAT32);    private set
+    var fmtLabel     by mutableStateOf("ISOFLASH");                        private set
+
+    var opState      by mutableStateOf(OpState());                        private set
+
+    // ── USB permission ────────────────────────────────────────────────────────
     private val usbManager get() =
         getApplication<Application>().getSystemService(Context.USB_SERVICE) as UsbManager
 
-    private var pendingPermCb: ((Boolean) -> Unit)? = null
+    private var permCb: ((Boolean) -> Unit)? = null
 
     private val permReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             if (intent.action != ACTION_USB_PERMISSION) return
-            val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            pendingPermCb?.invoke(granted); pendingPermCb = null
+            permCb?.invoke(intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false))
+            permCb = null
         }
     }
 
@@ -68,101 +75,134 @@ class BurnViewModel(application: Application) : AndroidViewModel(application) {
         runCatching { getApplication<Application>().unregisterReceiver(permReceiver) }
     }
 
+    // ── Public actions ────────────────────────────────────────────────────────
     fun refreshDrives() {
         drives = UsbScsiDevice.findDevices(getApplication())
-        if (selectedDrive != null && drives.none { it.usbDevice.deviceId == selectedDrive!!.usbDevice.deviceId })
+        if (selectedDrive != null &&
+            drives.none { it.usbDevice.deviceId == selectedDrive!!.usbDevice.deviceId })
             selectedDrive = null
     }
 
     fun selectDrive(d: UsbScsiDevice) {
         selectedDrive = d
-        if (uiState.phase != BurnPhase.WRITING) uiState = BurnUiState()
+        if (opState.phase != OpPhase.WORKING) opState = OpState()
     }
 
     fun selectIso(uri: Uri) {
         val ctx = getApplication<Application>()
-        ctx.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val ni = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val si = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst()) {
-                selectedIsoName = if (ni >= 0) cursor.getString(ni) else "image.iso"
-                selectedIsoSizeBytes = if (si >= 0) cursor.getLong(si) else 0L
+        ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val ni = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val si = c.getColumnIndex(OpenableColumns.SIZE)
+            if (c.moveToFirst()) {
+                isoName      = if (ni >= 0) c.getString(ni) else "image.iso"
+                isoSizeBytes = if (si >= 0) c.getLong(si) else 0L
             }
         }
         runCatching { ctx.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-        selectedIsoUri = uri
-        if (uiState.phase != BurnPhase.WRITING) uiState = BurnUiState()
+        isoUri = uri
+        if (opState.phase != OpPhase.WORKING) opState = OpState()
     }
 
-    private suspend fun requestPermission(device: UsbDevice): Boolean {
-        if (usbManager.hasPermission(device)) return true
-        return suspendCancellableCoroutine { cont ->
-            pendingPermCb = { granted -> if (cont.isActive) cont.resumeWith(Result.success(granted)) }
-            cont.invokeOnCancellation { pendingPermCb = null }
-            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
-            usbManager.requestPermission(device, PendingIntent.getBroadcast(getApplication(), 0, Intent(ACTION_USB_PERMISSION), flags))
-        }
-    }
+    fun setScheme(s: DiskFormatter.PartitionScheme) { fmtScheme = s }
+    fun setFmtType(t: DiskFormatter.FormatType)     { fmtType   = t }
+    fun setLabel(l: String)                          { fmtLabel  = l.take(11) }
 
     fun startBurn() {
         val drive = selectedDrive ?: return
-        val uri = selectedIsoUri ?: return
-        val ctx = getApplication<Application>()
+        val uri   = isoUri        ?: return
+        val ctx   = getApplication<Application>()
 
         viewModelScope.launch {
-            uiState = BurnUiState(BurnPhase.AWAITING_PERMISSION, "في انتظار إذن الوصول للجهاز…")
-            if (!requestPermission(drive.usbDevice)) {
-                uiState = BurnUiState(BurnPhase.FAILED, "تم رفض إذن الوصول إلى جهاز USB.")
-                return@launch
+            opState = OpState(OpPhase.AWAITING_PERMISSION, "في انتظار إذن USB…")
+            if (!requestPerm(drive.usbDevice)) {
+                opState = OpState(OpPhase.FAILED, "تم رفض الإذن."); return@launch
             }
-            uiState = BurnUiState(BurnPhase.WRITING, "جاري التهيئة…")
+            opState = OpState(OpPhase.WORKING, "جاري التهيئة…")
 
-            val totalBytes = selectedIsoSizeBytes.takeIf { it > 0 }
+            val totalBytes = isoSizeBytes.takeIf { it > 0 }
                 ?: runCatching { ctx.contentResolver.openAssetFileDescriptor(uri, "r")?.use { it.length } ?: -1L }.getOrDefault(-1L)
 
-            val result = withContext(Dispatchers.IO) {
+            withContext(Dispatchers.IO) {
                 runCatching {
                     drive.init()
                     try {
                         val chunkBytes = UsbScsiDevice.BLOCK_SIZE * 128
                         val buf = ByteArray(chunkBytes)
-                        val stream = ctx.contentResolver.openInputStream(uri) ?: error("Cannot open ISO")
-                        stream.use { input ->
+                        val stream = ctx.contentResolver.openInputStream(uri) ?: error("لا يمكن فتح الملف")
+                        stream.use { inp ->
                             var lba = 0L; var written = 0L
                             val t0 = System.currentTimeMillis(); var lastUi = 0L
                             while (true) {
-                                val read = input.read(buf)
-                                if (read <= 0) break
-                                val aligned = ((read + UsbScsiDevice.BLOCK_SIZE - 1) / UsbScsiDevice.BLOCK_SIZE) * UsbScsiDevice.BLOCK_SIZE
+                                val read = inp.read(buf); if (read <= 0) break
+                                val aligned = ((read + 511) / 512) * 512
                                 val chunk = if (aligned == buf.size) buf else ByteArray(aligned).also { System.arraycopy(buf, 0, it, 0, read) }
                                 drive.writeBlocks(lba, chunk)
-                                lba += aligned / UsbScsiDevice.BLOCK_SIZE; written += read
+                                lba += aligned / 512; written += read
                                 val now = System.currentTimeMillis()
                                 if (now - lastUi > 150) {
                                     lastUi = now
                                     val sec = (now - t0) / 1000.0
                                     val wMb = written / 1_048_576.0
-                                    val speed = if (sec > 0) wMb / sec else 0.0
-                                    val tMb = if (totalBytes > 0) totalBytes / 1_048_576.0 else wMb
                                     val prog = if (totalBytes > 0) (written.toFloat() / totalBytes).coerceIn(0f, 1f) else 0f
                                     withContext(Dispatchers.Main) {
-                                        uiState = BurnUiState(BurnPhase.WRITING, "جاري الحرق…", prog, speed, wMb, tMb)
+                                        opState = OpState(OpPhase.WORKING, "جاري الحرق…", prog, if (sec > 0) wMb / sec else 0.0)
                                     }
                                 }
                             }
-                            written
                         }
                     } finally { drive.close() }
                 }
+            }.onSuccess {
+                opState = OpState(OpPhase.DONE, "تم الحرق بنجاح ✓", 1f)
+            }.onFailure {
+                opState = OpState(OpPhase.FAILED, "فشل: ${it.message ?: it::class.simpleName}")
             }
-
-            result
-                .onSuccess { uiState = BurnUiState(BurnPhase.DONE, "تم الحرق بنجاح ✓  يمكنك إخراج الجهاز الآن.", 1f) }
-                .onFailure { uiState = BurnUiState(BurnPhase.FAILED, "فشل: ${it.message ?: it::class.simpleName}") }
         }
     }
 
-    fun reset() { uiState = BurnUiState() }
+    fun startFormat() {
+        val drive = selectedDrive ?: return
+        val opts  = DiskFormatter.Options(fmtScheme, fmtType, fmtLabel)
+
+        viewModelScope.launch {
+            opState = OpState(OpPhase.AWAITING_PERMISSION, "في انتظار إذن USB…")
+            if (!requestPerm(drive.usbDevice)) {
+                opState = OpState(OpPhase.FAILED, "تم رفض الإذن."); return@launch
+            }
+            opState = OpState(OpPhase.WORKING, "جاري العملية…")
+
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    drive.init()
+                    try {
+                        DiskFormatter.format(drive, opts) { prog, msg ->
+                            val main = Dispatchers.Main
+                            viewModelScope.launch(main) {
+                                opState = OpState(OpPhase.WORKING, msg, prog)
+                            }
+                        }
+                    } finally { drive.close() }
+                }
+            }.onSuccess {
+                opState = OpState(OpPhase.DONE, "اكتملت العملية ✓", 1f)
+            }.onFailure {
+                opState = OpState(OpPhase.FAILED, "فشل: ${it.message ?: it::class.simpleName}")
+            }
+        }
+    }
+
+    fun reset() { opState = OpState() }
+
+    // ── Permission helper ─────────────────────────────────────────────────────
+    private suspend fun requestPerm(device: UsbDevice): Boolean {
+        if (usbManager.hasPermission(device)) return true
+        return suspendCancellableCoroutine { cont ->
+            permCb = { granted -> if (cont.isActive) cont.resumeWith(Result.success(granted)) }
+            cont.invokeOnCancellation { permCb = null }
+            val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
+            usbManager.requestPermission(device, PendingIntent.getBroadcast(getApplication(), 0, Intent(ACTION_USB_PERMISSION), flags))
+        }
+    }
 
     companion object { const val ACTION_USB_PERMISSION = "com.xfff0.isoflash.USB_PERMISSION" }
 }
