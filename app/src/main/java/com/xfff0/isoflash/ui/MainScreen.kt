@@ -154,7 +154,7 @@ private fun FormatTab(viewModel: BurnViewModel) {
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (sel) AccentTealDim else SurfaceCardAlt)
                             .border(1.dp, if (sel) AccentTeal else BorderSubtle, RoundedCornerShape(10.dp))
-                            .clickable { viewModel.setScheme(s) }
+                            .clickable { viewModel.fmtScheme = s }
                             .padding(vertical = 14.dp),
                         contentAlignment = Alignment.Center
                     ) {
@@ -185,11 +185,11 @@ private fun FormatTab(viewModel: BurnViewModel) {
                             .clip(RoundedCornerShape(10.dp))
                             .background(if (sel) AccentTealDim else SurfaceCardAlt)
                             .border(1.dp, if (sel) AccentTeal else BorderSubtle, RoundedCornerShape(10.dp))
-                            .clickable { viewModel.setFmtType(type) }
+                            .clickable { viewModel.fmtType = type }
                             .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        RadioButton(selected = sel, onClick = { viewModel.setFmtType(type) },
+                        RadioButton(selected = sel, onClick = { viewModel.fmtType = type },
                             colors = RadioButtonDefaults.colors(selectedColor = AccentTeal))
                         Spacer(Modifier.width(8.dp))
                         Column {
@@ -205,7 +205,7 @@ private fun FormatTab(viewModel: BurnViewModel) {
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(
                     value = label,
-                    onValueChange = { label = it.uppercase().take(11); viewModel.setLabel(label) },
+                    onValueChange = { label = it.uppercase().take(11); viewModel.fmtLabel = label },
                     label = { Text("تسمية القرص (Label)", color = TextSecondary) },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(

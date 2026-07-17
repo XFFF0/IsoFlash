@@ -42,9 +42,9 @@ class BurnViewModel(application: Application) : AndroidViewModel(application) {
     var isoSizeBytes by mutableStateOf(0L);                              private set
 
     // Format options
-    var fmtScheme    by mutableStateOf(DiskFormatter.PartitionScheme.MBR); private set
-    var fmtType      by mutableStateOf(DiskFormatter.FormatType.FAT32);    private set
-    var fmtLabel     by mutableStateOf("ISOFLASH");                        private set
+    var fmtScheme    by mutableStateOf(DiskFormatter.PartitionScheme.MBR)
+    var fmtType      by mutableStateOf(DiskFormatter.FormatType.FAT32)
+    var fmtLabel     by mutableStateOf("ISOFLASH")
 
     var opState      by mutableStateOf(OpState());                        private set
 
@@ -103,9 +103,6 @@ class BurnViewModel(application: Application) : AndroidViewModel(application) {
         if (opState.phase != OpPhase.WORKING) opState = OpState()
     }
 
-    fun setScheme(s: DiskFormatter.PartitionScheme) { fmtScheme = s }
-    fun setFmtType(t: DiskFormatter.FormatType)     { fmtType   = t }
-    fun setLabel(l: String)                          { fmtLabel  = l.take(11) }
 
     fun startBurn() {
         val drive = selectedDrive ?: return
