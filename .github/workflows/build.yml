@@ -1,8 +1,9 @@
-name: Build IsoFlash APK
+name: Build & Release IsoFlash
 
 on:
   push:
     branches: [ main ]
+    tags:     [ 'v*' ]
   workflow_dispatch:
 
 permissions:
@@ -46,11 +47,45 @@ jobs:
           git add build-log.txt
           git commit -m "CI log $(date -u +'%Y-%m-%d %H:%M')" || true
           git push -f https://x-access-token:${GITHUB_TOKEN}@github.com/XFFF0/IsoFlash.git HEAD:ci-logs
+          git checkout main
 
-      - name: Upload APK
+      - name: Upload APK artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: IsoFlash-debug
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Create / Update GitHub Release
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          TAG=v1.0
+
+          # Delete existing release + tag if present (so we can re-upload)
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" "$APK#IsoFlash-v1.0.apk" \
+            --title "IsoFlash v1.0" \
+            --notes "## IsoFlash v1.0
+
+تطبيق أندرويد لحرق ملفات ISO على أقراص USB بدون روت.
+
+### المميزات
+- ⚡ حرق ISO مباشرة على USB (مثل dd / Etcher)
+- 💾 تهيئة FAT32 مع اختيار MBR أو GPT
+- 🗑️ مسح كامل للقرص (zero fill)
+- 🔒 بدون روت — يستخدم Android USB Host API
+
+### التثبيت
+1. حمّل ملف **IsoFlash-v1.0.apk**
+2. فعّل «تثبيت من مصادر غير معروفة» في الإعدادات
+3. ثبّت الملف مباشرة
+
+### المتطلبات
+- Android 8.0 (API 26) أو أحدث
+- جهاز يدعم USB OTG (Host Mode)"
