@@ -29,12 +29,14 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build APK
+        id: build
         run: |
           set -o pipefail
           gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build.log
 
       - name: Push log to ci-logs branch
         if: always()
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -49,7 +51,7 @@ jobs:
           git checkout main
 
       - name: Upload APK artifact
-        if: success()
+        if: steps.build.conclusion == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: IsoFlash-debug
@@ -57,7 +59,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: success()
+        if: steps.build.conclusion == 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
