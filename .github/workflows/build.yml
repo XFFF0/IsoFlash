@@ -3,7 +3,6 @@ name: Build & Release IsoFlash
 on:
   push:
     branches: [ main ]
-    tags:     [ 'v*' ]
   workflow_dispatch:
 
 permissions:
@@ -57,35 +56,35 @@ jobs:
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-      - name: Create / Update GitHub Release
+      - name: Create GitHub Release
         if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          APK=app/build/outputs/apk/debug/app-debug.apk
-          TAG=v1.0
-
-          # Delete existing release + tag if present (so we can re-upload)
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          TAG="v1.0"
           gh release delete "$TAG" --yes 2>/dev/null || true
           git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          cat > /tmp/notes.md << 'NOTES'
+          ## IsoFlash v1.0
 
+          Android app to burn ISO files to USB without root.
+
+          ### Features
+          - Burn ISO directly to USB (like dd/Etcher)
+          - Format as FAT32 with MBR or GPT
+          - Full wipe (zero fill)
+          - No root required
+
+          ### Install
+          1. Download IsoFlash-v1.0.apk
+          2. Enable "Install from unknown sources"
+          3. Install the APK
+
+          ### Requirements
+          - Android 8.0+ (API 26)
+          - USB OTG / Host Mode support
+          NOTES
           gh release create "$TAG" "$APK#IsoFlash-v1.0.apk" \
             --title "IsoFlash v1.0" \
-            --notes "## IsoFlash v1.0
-
-تطبيق أندرويد لحرق ملفات ISO على أقراص USB بدون روت.
-
-### المميزات
-- ⚡ حرق ISO مباشرة على USB (مثل dd / Etcher)
-- 💾 تهيئة FAT32 مع اختيار MBR أو GPT
-- 🗑️ مسح كامل للقرص (zero fill)
-- 🔒 بدون روت — يستخدم Android USB Host API
-
-### التثبيت
-1. حمّل ملف **IsoFlash-v1.0.apk**
-2. فعّل «تثبيت من مصادر غير معروفة» في الإعدادات
-3. ثبّت الملف مباشرة
-
-### المتطلبات
-- Android 8.0 (API 26) أو أحدث
-- جهاز يدعم USB OTG (Host Mode)"
+            --notes-file /tmp/notes.md
